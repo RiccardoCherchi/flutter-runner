@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+#
+# fr: run `flutter run` detached and keep one machine-wide record of every
+# instance, so any terminal, agent or worktree can find, reload and stop it.
+#
+#   fr start [-d device] [-- flutter run args]   # default: the booted iOS simulator
+#   fr reload | restart | stop | uri   [instance]
+#   fr logs [-f] [-n lines] [instance]
+#   fr status [--json]                           # every instance on this machine
+#
+# instance is the number `fr status` shows first, or a prefix of the device id
+# (-d also works).
+# Without it, a command acts on the instance started from the current checkout,
+# or on the only running instance.
+#
+# A device runs one instance; start from another checkout fails with exit 3
+# until that instance is stopped. The VM Service URI of the checkout's instance
+# is readable at .dart_tool/fr.uri.
+#
+# Exit codes: 0 ok, 1 failure (build, reload, not running), 2 usage, 3 device busy.
+
+set -euo pipefail
+
+STATE="${FR_STATE:-$HOME/.local/state/fr}"
+mkdir -p "$STATE"
+
+die() { echo "fr: $*" >&2; exit "${code:-1}"; }
+
+project_root() {
+  local d
+  d=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  [[ -f "$d/pubspec.yaml" ]] || d=$(pwd)
+  [[ -f "$d/pubspec.yaml" ]] || code=2 die "no pubspec.yaml in $(pwd)"
+  echo "$d"
+}
+
+# A slot is alive only if its pid still runs flutter: pid files outlive crashes
+# and pids get reused.
+alive() {
+  local pid
+  pid=$(cat "$1/pid" 2>/dev/null) || return 1
+  ps -o command= -p "$pid" 2>/dev/null | grep -q flutter
+}
+
+# Running, or still building inside fr start.
+active() {
+  alive "$1" || { [[ -f "$1/starting" ]] && kill -0 "$(cat "$1/starting")" 2>/dev/null; }
+}
+
+# Drop slots whose flutter run is gone, so stale URIs never point at a dead app.
+prune() {
+  local s
+  for s in "$STATE"/*/; do
+    [[ -d "$s" ]] || continue
+    s=${s%/}
+    [[ -f "$s/starting" ]] && kill -0 "$(cat "$s/starting")" 2>/dev/null && continue
+    alive "$s" || rm -f "$s/pid" "$s/uri" "$s/starting"
+  done
+}
+
+# Slot to act on: the device matching the selector (an id prefix), else the
+# instance started from this checkout, else the only running instance.
+find_slot() {
+  local sel="$1" root s match="" n=0 live="" nlive=0
+  if [[ -n "$sel" ]]; then
+    for s in "$STATE"/*/; do
+      s=${s%/}
+      [[ -d "$s" ]] || continue
+      if [[ "$sel" == *[!0-9]* ]]; then
+        [[ "$(basename "$s")" == "$sel"* ]] || continue
+      else
+        active "$s" && [[ "$(cat "$s/id" 2>/dev/null)" == "$sel" ]] || continue
+      fi
+      match="$s"; n=$((n + 1))
+    done
+    ((n == 1)) && { echo "$match"; return; }
+    ((n == 0)) && die "no instance $sel (fr status lists all instances)"
+    code=2 die "$sel matches several devices; give more of the id"
+  fi
+  root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  # Prefer a live slot; a dead one still serves its logs.
+  for s in "$STATE"/*/; do
+    s=${s%/}
+    [[ -d "$s" ]] || continue
+    alive "$s" && { live="$s"; nlive=$((nlive + 1)); }
+    [[ "$(cat "$s/root" 2>/dev/null)" == "$root" ]] || continue
+    alive "$s" && { echo "$s"; return; }
+    match="$s"
+  done
+  [[ -n "$match" ]] && { echo "$match"; return; }
+  ((nlive == 1)) && { echo "$live"; return; }
+  ((nlive == 0)) && die "nothing running"
+  code=2 die "several instances running; pass the number from fr status"
+}
+
+booted_simulator() {
+  xcrun simctl list devices booted 2>/dev/null | grep -oE '[0-9A-F-]{36}' | head -1
+}
+
+cmd_start() {
+  local dev="" root slot
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d) dev="${2:?-d needs a device}"; shift 2 ;;
+      --) shift; break ;;
+      *) code=2 die "unknown start option $1" ;;
+    esac
+  done
+  root=$(project_root)
+  dev="${dev:-$(booted_simulator)}"
+  [[ -n "$dev" ]] || die "no booted simulator; pass -d <device>"
+  slot="$STATE/$dev"
+  mkdir -p "$slot"
+  if active "$slot"; then
+    if [[ "$(cat "$slot/root")" == "$root" ]]; then
+      echo "already running on $dev: $(cat "$slot/uri" 2>/dev/null || echo starting)"
+      return
+    fi
+    code=3 die "$dev busy with $(cat "$slot/root") ($(cat "$slot/branch")); fr stop -d $dev first"
+  fi
+  rm -f "$slot/pid" "$slot/uri"
+  echo "$root" >"$slot/root"
+  git -C "$root" branch --show-current 2>/dev/null >"$slot/branch" || true
+  [[ -s "$slot/branch" ]] || echo detached >"$slot/branch"
+  date +%s >"$slot/started"
+  # Short id for humans: the smallest number no other active instance holds.
+  local id=0 used="" s
+  for s in "$STATE"/*/; do
+    s=${s%/}
+    [[ "$s" != "$slot" ]] && active "$s" && used="$used $(cat "$s/id" 2>/dev/null) "
+  done
+  while [[ "$used" == *" $id "* ]]; do id=$((id + 1)); done
+  echo "$id" >"$slot/id"
+  : >"$slot/log"
+  # Stable per-checkout path for tools that read the URI; dangles once the run dies.
+  mkdir -p "$root/.dart_tool" && ln -sfn "$slot/uri" "$root/.dart_tool/fr.uri"
+  # New session (setsid) so the run survives the shell or agent that started it.
+  (cd "$root" && exec perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' \
+    flutter run -d "$dev" --pid-file="$slot/pid" --vmservice-out-file="$slot/uri" "$@" \
+    </dev/null >>"$slot/log" 2>&1) &
+  echo $! >"$slot/starting"
+  # The first build takes minutes: stream its output (to stderr, so stdout stays
+  # the one result line) until the VM Service is up or flutter run exits.
+  tail -n +1 -f "$slot/log" >&2 &
+  tailer=$!
+  disown
+  trap 'kill $tailer 2>/dev/null || true' EXIT
+  until [[ -s "$slot/uri" ]]; do
+    if ! kill -0 "$(cat "$slot/starting")" 2>/dev/null; then
+      rm -f "$slot/starting"
+      sleep 0.5
+      die "flutter run exited"
+    fi
+    sleep 1
+  done
+  sleep 0.5
+  kill $tailer 2>/dev/null
+  rm -f "$slot/starting"
+  echo "running on $dev: $(cat "$slot/uri")"
+}
+
+# Signal flutter run, then wait for its verdict in the new part of the log.
+signal_and_wait() {
+  local slot="$1" sig="$2" ok="$3" from line
+  alive "$slot" || die "not running on $(basename "$slot")"
+  from=$(($(wc -l <"$slot/log") + 1))
+  kill "-$sig" "$(cat "$slot/pid")"
+  for _ in $(seq 120); do
+    sleep 0.5
+    line=$(tail -n +"$from" "$slot/log" | grep -E "$ok|: Error: |Try again after fixing|rejected|[Ff]ailed|Lost connection" | tail -1) || true
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ $ok ]]; then echo "$line"; return; fi
+    tail -n +"$from" "$slot/log" | tail -30 >&2
+    die "$line"
+  done
+  die "no answer after 60s; see fr logs"
+}
+
+cmd_status() {
+  local json=0 s first=1 now pid
+  [[ "${1:-}" == --json ]] && json=1
+  now=$(date +%s)
+  ((json)) && printf '['
+  for s in "$STATE"/*/; do
+    s=${s%/}
+    [[ -f "$s/pid" || -f "$s/starting" ]] || continue
+    pid=$(cat "$s/pid" 2>/dev/null || echo "")
+    local state=running uri up
+    [[ -f "$s/starting" ]] && state=starting
+    uri=$(cat "$s/uri" 2>/dev/null || echo "")
+    up=$((now - $(cat "$s/started")))
+    if ((json)); then
+      ((first)) || printf ','
+      printf '{"id":%s,"device":"%s","state":"%s","pid":"%s","root":"%s","branch":"%s","uptime_s":%d,"uri":"%s"}' \
+        "$(cat "$s/id")" "$(basename "$s")" "$state" "$pid" "$(cat "$s/root")" "$(cat "$s/branch")" "$up" "$uri"
+    else
+      printf '%s  %s  %s  %s (%s)  up %dm  pid %s  %s\n' "$(cat "$s/id")" "$(basename "$s")" "$state" \
+        "$(cat "$s/root")" "$(cat "$s/branch")" $((up / 60)) "${pid:--}" "${uri:--}"
+    fi
+    first=0
+  done
+  if ((json)); then echo ']'; elif ((first)); then echo "nothing running"; fi
+}
+
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift
+dev="" follow=0 lines=40
+if [[ "$cmd" != start && "$cmd" != status ]]; then
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d) dev="${2:?-d needs a device}"; shift 2 ;;
+      -f) follow=1; shift ;;
+      -n) lines="${2:?-n needs a number}"; shift 2 ;;
+      *) dev="$1"; shift ;;
+    esac
+  done
+fi
+prune
+
+case "$cmd" in
+  start) cmd_start "$@" ;;
+  reload) slot=$(find_slot "$dev"); signal_and_wait "$slot" USR1 'Reloaded' ;;
+  restart) slot=$(find_slot "$dev"); signal_and_wait "$slot" USR2 'Restarted' ;;
+  stop)
+    slot=$(find_slot "$dev")
+    if alive "$slot"; then
+      pid=$(cat "$slot/pid")
+      kill "$pid"
+      for _ in $(seq 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$slot/pid" "$slot/uri" "$slot/starting"
+    echo "stopped $(basename "$slot")"
+    ;;
+  status) cmd_status "$@" ;;
+  logs)
+    slot=$(find_slot "$dev")
+    if ((follow)); then tail -n "$lines" -f "$slot/log"; else tail -n "$lines" "$slot/log"; fi
+    ;;
+  uri)
+    slot=$(find_slot "$dev")
+    [[ -s "$slot/uri" ]] || die "no VM Service URI yet"
+    cat "$slot/uri"
+    ;;
+  *) sed -n 3,20p "$0"; exit 2 ;;
+esac
