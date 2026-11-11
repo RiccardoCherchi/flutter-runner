@@ -1,0 +1,57 @@
+{
+  "name": "flutter-runner",
+  "displayName": "Flutter Runner: Persistent Sessions",
+  "description": "Start persistent fr instances and use the native Flutter debugger, hot reload and hot restart.",
+  "version": "0.1.2",
+  "icon": "icon.png",
+  "publisher": "RiccardoCherchi",
+  "author": "Riccardo",
+  "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "https://github.com/RiccardoCherchi/flutter-runner.git" },
+  "engines": { "vscode": "^1.95.0" },
+  "categories": ["Debuggers"],
+  "main": "./extension.js",
+  "extensionKind": ["workspace"],
+  "extensionDependencies": ["Dart-Code.flutter"],
+  "capabilities": { "untrustedWorkspaces": { "supported": false }, "virtualWorkspaces": false },
+  "activationEvents": ["onDebugResolve:flutter-runner"],
+  "scripts": { "test": "node --test test/*.test.js" },
+  "contributes": {
+    "commands": [
+      { "command": "flutterRunner.startDebugging", "title": "Flutter Runner: Start Debugging" },
+      { "command": "flutterRunner.hotReload", "title": "Flutter Runner: Hot Reload", "icon": "$(zap)" },
+      { "command": "flutterRunner.stop", "title": "Flutter Runner: Stop Instance" }
+    ],
+    "menus": {
+      "debug/toolBar": [{ "command": "flutterRunner.hotReload", "when": "debugType == flutter-runner && debugState == running", "group": "navigation@1" }]
+    },
+    "configuration": {
+      "title": "Flutter Runner",
+      "properties": {
+        "flutterRunner.executable": {
+          "type": "string", "default": "fr", "scope": "machine-overridable",
+          "description": "Path to the installed fr executable. Flutter must also be available on PATH."
+        }
+      }
+    },
+    "debuggers": [{
+      "type": "flutter-runner",
+      "label": "Flutter Runner",
+      "languages": ["dart"],
+      "configurationAttributes": {
+        "launch": {
+          "properties": {
+            "deviceId": { "type": "string", "description": "Exact device ID. Omit to reuse this checkout's instance or start on the booted iOS simulator." },
+            "toolArgs": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Literal flutter run arguments, used only when starting a new instance." },
+            "program": { "type": "string", "default": "lib/main.dart", "description": "Literal entry point relative to the workspace folder." }
+          }
+        }
+      },
+      "initialConfigurations": [{ "type": "flutter-runner", "request": "launch", "name": "Flutter Runner" }],
+      "configurationSnippets": [{
+        "label": "Flutter Runner: persistent debug session",
+        "body": { "type": "flutter-runner", "request": "launch", "name": "Flutter Runner" }
+      }]
+    }]
+  }
+}
